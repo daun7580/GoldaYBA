@@ -1,3 +1,5 @@
+-- GoldaYBA loader: checks the key, then pulls the hub from the key server.
+-- Put your Worker address and the link where people buy keys below.
 local API = "https://morning-base-3d8e.daun7580.workers.dev"
 local GET_KEY_LINK = "https://discord.gg/5JvnRB8TZk"
 
@@ -10,6 +12,7 @@ local lp = Players.LocalPlayer
 local DIR = "GoldaYBA"
 local KEY_FILE = DIR .. "/Key.txt"
 
+-- Device id: executor HWID first, Roblox client id as a fallback
 local function getHwid()
     local ok, id = pcall(function() return gethwid and gethwid() end)
     if ok and type(id) == "string" and id ~= "" then return id end
@@ -71,33 +74,36 @@ local function timeLeft(expires)
     return m .. "m left"
 end
 
-local function launch(key, expires)
+local env = (getgenv and getgenv()) or _G
+
+-- Runs the hub. Returns true, or false + a reason that the window can show.
+local function launch(key, expires, report)
+    report = report or function() end
     saveKey(key)
-    local env = (getgenv and getgenv()) or _G
     env.GoldaYBA_Key = { key = key, expires = expires or 0, left = timeLeft(expires) }
 
+    report("Downloading the hub...")
     local src = call("/script", key)
-    if not src or (src:sub(1, 2) == "--" and #src < 200) then
-        warn("[GoldaYBA] couldn't load the hub: " .. tostring(src))
-        return false
+    if not src then return false, "Couldn't download the hub, try again" end
+    if src:sub(1, 2) == "--" and #src < 200 then
+        return false, "Server: " .. src:sub(3):gsub("^%s+", "")
     end
+
+    report("Starting the hub (" .. math.floor(#src / 1024) .. " KB)...")
     local fn, err = loadstring(src)
-    if not fn then
-        warn("[GoldaYBA] the hub didn't compile: " .. tostring(err))
-        return false
+    if not fn then return false, "The hub is broken: " .. tostring(err):sub(1, 120) end
+
+    local ok, runErr = xpcall(fn, function(e) return tostring(e) end)
+    if not ok then
+        warn("[GoldaYBA] hub error: " .. tostring(runErr))
+        return false, "The hub crashed: " .. tostring(runErr):sub(1, 120)
     end
-    task.spawn(fn)
     return true
 end
 
 local saved = readKey()
-local savedError
-if saved then
-    local ok, why, expires = check(saved)
-    if ok and launch(saved, expires) then return end
-    savedError = why
-end
 
+-- Key window
 local function guiParent()
     local ok, g = pcall(function() return gethui and gethui() end)
     if ok and g then return g end
@@ -178,6 +184,7 @@ win.Parent = gui
 corner(win, 8)
 stroke(win, C.line, 0.15)
 
+-- accent line along the top edge
 local topLine = Instance.new("Frame")
 topLine.Size = UDim2.new(1, 0, 0, 2)
 topLine.BorderSizePixel = 0
@@ -185,6 +192,7 @@ topLine.BackgroundColor3 = Color3.new(1, 1, 1)
 topLine.Parent = win
 gradient(topLine)
 
+-- header: badge, name, subtitle, close
 local badge = Instance.new("TextLabel")
 badge.Position = UDim2.fromOffset(16, 16)
 badge.Size = UDim2.fromOffset(28, 28)
@@ -221,6 +229,7 @@ corner(close, 6)
 stroke(close, C.line, 0.3)
 close.MouseButton1Click:Connect(function() gui:Destroy() end)
 
+-- key field
 local field = Instance.new("Frame")
 field.Position = UDim2.fromOffset(16, 60)
 field.Size = UDim2.new(1, -32, 0, 38)
@@ -255,6 +264,7 @@ box.FocusLost:Connect(function()
     TweenService:Create(fieldStroke, TweenInfo.new(0.15), { Color = C.line, Transparency = 0.1 }):Play()
 end)
 
+-- buttons
 local function button(text, x, primary)
     local b = Instance.new("TextButton")
     b.Position = UDim2.new(x, x == 0 and 16 or 5, 0, 110)
@@ -286,11 +296,12 @@ end
 local checkBtn = button("Check key", 0, true)
 local getBtn = button("Get key", 0.5, false)
 
+-- status line
 local statusDot = Instance.new("Frame")
 statusDot.Position = UDim2.fromOffset(17, 163)
 statusDot.Size = UDim2.fromOffset(6, 6)
 statusDot.BorderSizePixel = 0
-statusDot.BackgroundColor3 = savedError and C.bad or C.dim
+statusDot.BackgroundColor3 = C.dim
 statusDot.Parent = win
 corner(statusDot, 3)
 
@@ -310,31 +321,46 @@ local function setStatus(t, color)
     statusDot.BackgroundColor3 = color or C.dim
 end
 
-setStatus(savedError and ("Saved key: " .. savedError) or "Paste your key and hit Check", savedError and C.bad or nil)
-
+-- one place that checks a key and starts the hub, with every step shown in the window
 local busy = false
-checkBtn.MouseButton1Click:Connect(function()
+local function run(key)
     if busy then return end
-    local key = box.Text:gsub("%s", "")
+    key = (key or ""):gsub("%s", "")
     if key == "" then
         setStatus("Paste a key first", C.bad)
         return
     end
     busy = true
-    setStatus("Checking...", C.accent)
+    setStatus("Checking the key...", C.accent)
+
     local ok, why, expires = check(key)
-    if ok then
-        setStatus("Key works (" .. timeLeft(expires) .. "), loading...", C.good)
-        task.wait(0.4)
-        gui:Destroy()
-        if not launch(key, expires) then
-            warn("[GoldaYBA] the key is fine but the hub didn't load, try again in a minute")
-        end
-    else
+    if not ok then
         setStatus(why, C.bad)
+        busy = false
+        return
+    end
+
+    setStatus("Key works (" .. timeLeft(expires) .. ")", C.good)
+
+    -- heavy obfuscation can take a while to start, say so instead of looking frozen
+    local finished = false
+    task.delay(15, function()
+        if not finished and gui.Parent then
+            setStatus("Still starting... if this never ends, the hub is obfuscated too hard", C.accent)
+        end
+    end)
+
+    local started, err = launch(key, expires, function(t) setStatus(t, C.accent) end)
+    finished = true
+    if started then
+        gui:Destroy()
+    else
+        setStatus(err, C.bad)
     end
     busy = false
-end)
+end
+
+checkBtn.MouseButton1Click:Connect(function() run(box.Text) end)
 
 getBtn.MouseButton1Click:Connect(function()
     if setclipboard then
@@ -344,4 +370,10 @@ getBtn.MouseButton1Click:Connect(function()
         setStatus(GET_KEY_LINK)
     end
 end)
+
+if saved then
+    task.spawn(run, saved)
+else
+    setStatus("Paste your key and hit Check")
+end
 
