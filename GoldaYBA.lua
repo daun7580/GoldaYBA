@@ -76,10 +76,13 @@ end
 
 local env = (getgenv and getgenv()) or _G
 
--- Runs the hub. Returns true, or false + a reason that the window can show.
+-- Runs the hub. The hub yields (waits for Fluent, HttpGet, map objects), and you
+-- cannot yield across an xpcall boundary, so it must run in its own thread.
+-- Success is detected by the hub setting getgenv().GoldaYBA_Unload at the end of load.
 local function launch(key, expires, report)
     report = report or function() end
     saveKey(key)
+    env.GoldaYBA_Unload = nil
     env.GoldaYBA_Key = { key = key, expires = expires or 0, left = timeLeft(expires) }
 
     report("Downloading the hub...")
@@ -93,12 +96,25 @@ local function launch(key, expires, report)
     local fn, err = loadstring(src)
     if not fn then return false, "The hub is broken: " .. tostring(err):sub(1, 120) end
 
-    local ok, runErr = xpcall(fn, function(e) return tostring(e) end)
-    if not ok then
-        warn("[GoldaYBA] hub error: " .. tostring(runErr))
-        return false, "The hub crashed: " .. tostring(runErr):sub(1, 120)
+    -- run the hub in a thread that is allowed to yield
+    local crashed
+    task.spawn(function()
+        local ok, e = xpcall(fn, function(er) return tostring(er) end)
+        if not ok then
+            crashed = tostring(e)
+            warn("[GoldaYBA] hub error: " .. crashed)
+        end
+    end)
+
+    -- wait for it to finish loading or to crash
+    local t0 = os.clock()
+    while os.clock() - t0 < 25 do
+        if env.GoldaYBA_Unload then return true end
+        if crashed then return false, "The hub crashed: " .. crashed:sub(1, 140) end
+        task.wait(0.1)
     end
-    return true
+    if env.GoldaYBA_Unload then return true end
+    return false, "The hub didn't finish loading in time"
 end
 
 local saved = readKey()
